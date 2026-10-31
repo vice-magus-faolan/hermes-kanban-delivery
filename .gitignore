@@ -1,0 +1,21 @@
+# Python/build output
+__pycache__/
+*.py[cod]
+/.venv/
+/.pytest_cache/
+/.ruff_cache/
+/.coverage
+/htmlcov/
+/build/
+/dist/
+/*.egg-info/
+
+# Explicit local runtime roots; keep docs, schemas and fixtures visible.
+/.kanban-delivery-runtime/
+/.hermes-test-home/
+/.hermes-runtime-source/
+/.test-scratch/
+/config.local.yaml
+/.env
+/.env.*
+!/.env.example
