@@ -83,11 +83,14 @@ def database_path(home: Path, board: str) -> Path:
 def snapshot(filename: Path):
     if not filename.is_file():
         raise QueryError("store_missing")
-    # SQLite can create missing WAL shared-memory files even with mode=ro.
-    # Do not open such an incomplete live store on a read-only query's behalf.
+    # mode=ro can create BOTH sidecars for a cleanly closed WAL database.
+    # SQLite's persisted read/write format bytes (18/19) identify WAL even
+    # when neither sidecar exists; never open an incomplete WAL store for it.
+    with filename.open("rb") as stream:
+        wal_mode = 2 in stream.read(20)[18:20]
     wal = filename.with_name(filename.name + "-wal")
     shm = filename.with_name(filename.name + "-shm")
-    if wal.exists() and not shm.exists():
+    if (wal_mode or wal.exists() or shm.exists()) and not (wal.is_file() and shm.is_file()):
         raise QueryError("store_sidecars_unavailable")
     with closing(sqlite3.connect(filename.as_uri() + "?mode=ro", uri=True, timeout=1)) as conn:
         conn.row_factory = sqlite3.Row

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import stat
 
 from .values import PROFILE, QueryError, literal, path, text
 
@@ -78,10 +80,17 @@ def effect_view(config: dict, defaults: object) -> dict:
 def load(home: Path, board: str) -> dict:
     filename = home / "kanban" / "delivery-policy.json"
     try:
-        with filename.open("rb") as stream:
-            raw = stream.read(MAX_POLICY_BYTES + 1)
+        # Nonblocking open lets us reject a FIFO without waiting for a writer.
+        descriptor = os.open(filename, os.O_RDONLY | os.O_NONBLOCK)
     except FileNotFoundError:
         return {"state": "missing", "diagnostics": ["policy_missing"]}
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise QueryError("policy_not_regular")
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            raw = stream.read(MAX_POLICY_BYTES + 1)
+    finally:
+        os.close(descriptor)
     if len(raw) > MAX_POLICY_BYTES:
         raise QueryError("policy_size_limit")
     try:

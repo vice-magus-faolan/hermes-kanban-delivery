@@ -7,6 +7,8 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
+import sqlite3
 import subprocess
 import sys
 
@@ -382,6 +384,127 @@ def test_registered_query_has_no_effect_attempts(native):
 
 def file_bytes(root):
     return {str(p.relative_to(root)): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+
+
+@pytest.mark.parametrize("mode", ["wal", "delete"])
+def test_first_query_preserves_closed_store(native, mode):
+    assert native.conn.execute("PRAGMA journal_mode=" + mode).fetchone()[0].lower() == mode
+    native.claim()
+    filename = Path(native.conn.execute("PRAGMA database_list").fetchone()[2])
+    native.conn.close()
+    assert filename.read_bytes()[18:20] == (b"\x02\x02" if mode == "wal" else b"\x01\x01")
+    assert not filename.with_name(filename.name + "-wal").exists()
+    assert not filename.with_name(filename.name + "-shm").exists()
+    # No priming query: both membership and bytes precede the first public read.
+    paths, before = set(native.home.rglob("*")), file_bytes(native.home)
+    result = native.query()
+    assert set(native.home.rglob("*")) == paths
+    assert file_bytes(native.home) == before
+    if mode == "wal":
+        assert result == {"ok": False, "error": "store_sidecars_unavailable"}
+    else:
+        assert result["ok"] and result["context"]["phase"] == "builder"
+
+
+def test_live_wal_reads_committed_wal_only_state(native):
+    assert native.conn.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    assert native.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0] == 0
+    filename = Path(native.conn.execute("PRAGMA database_list").fetchone()[2])
+    main_before = filename.read_bytes()
+    # An actual reader pins the pre-claim snapshot while the native writer commits.
+    reader = sqlite3.connect(filename)
+    try:
+        reader.execute("BEGIN")
+        old_status = reader.execute("SELECT status FROM tasks WHERE id=?", (native.task,)).fetchone()[0]
+        assert old_status != "running"
+        native.claim()
+        wal = filename.with_name(filename.name + "-wal")
+        shm = filename.with_name(filename.name + "-shm")
+        assert wal.is_file() and shm.is_file() and wal.stat().st_size > 32
+        assert filename.read_bytes() == main_before
+        wal_before, paths = wal.read_bytes(), set(filename.parent.iterdir())
+        result = native.query()
+        assert result["ok"] and result["context"]["phase"] == "builder", result
+        assert result["context"]["run_id"] == native.run
+        assert reader.execute("SELECT status FROM tasks WHERE id=?", (native.task,)).fetchone()[0] == old_status
+        assert filename.read_bytes() == main_before and wal.read_bytes() == wal_before
+        assert set(filename.parent.iterdir()) == paths
+    finally:
+        reader.close()
+
+
+@pytest.mark.parametrize("remaining", ["wal", "shm"])
+def test_partial_wal_sidecars_are_not_repaired(native, remaining):
+    assert native.conn.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    native.claim()
+    filename = Path(native.conn.execute("PRAGMA database_list").fetchone()[2])
+    sidecars = {kind: filename.with_name(filename.name + "-" + kind) for kind in ("wal", "shm")}
+    retained = sidecars[remaining].read_bytes()
+    native.conn.close()
+    assert all(not path.exists() for path in sidecars.values())
+    # Re-create one native-produced sidecar only after the owned writer closes.
+    sidecars[remaining].write_bytes(retained)
+    paths, before = set(native.home.rglob("*")), file_bytes(native.home)
+    result = native.query()
+    assert set(native.home.rglob("*")) == paths
+    assert file_bytes(native.home) == before
+    assert result == {"ok": False, "error": "store_sidecars_unavailable"}
+
+
+@pytest.mark.parametrize("name", ["delivery_policy_check", "delivery_context"])
+def test_symlink_policy_is_refused_with_valid_native_state(native, name):
+    native.claim()
+    assert native.query(name)["ok"]
+    target = native.policy.with_name("retained-policy.json")
+    native.policy.rename(target)
+    native.policy.symlink_to(target)
+    before = file_bytes(native.home)
+    assert native.query(name) == {"ok": False, "error": "policy_path_fence"}
+    assert native.policy.is_symlink() and file_bytes(native.home) == before
+
+
+@pytest.mark.parametrize("linked", ["database", "board"])
+def test_symlink_board_is_refused_with_valid_native_state(native, linked):
+    native.claim()
+    assert native.query()["ok"]
+    filename = Path(native.conn.execute("PRAGMA database_list").fetchone()[2])
+    native.conn.close()
+    original = filename if linked == "database" else filename.parent
+    target = original.with_name("retained-" + original.name)
+    original.rename(target)
+    original.symlink_to(target, target_is_directory=linked == "board")
+    before = file_bytes(native.home)
+    assert native.query() == {"ok": False, "error": "store_fence"}
+    assert original.is_symlink() and file_bytes(native.home) == before
+
+
+@pytest.mark.parametrize("kind", ["fifo", "directory"])
+def test_nonregular_policy_is_refused_promptly(native, kind):
+    assert native.query("delivery_policy_check")["policy"]["state"] == "valid"
+    native.policy.unlink()
+    if kind == "fifo":
+        os.mkfifo(native.policy)
+    else:
+        native.policy.mkdir()
+    mode = native.policy.stat().st_mode
+    expired = []
+
+    def deadline(signum, frame):
+        expired.append(True)
+        raise TimeoutError("policy query exceeded deadline")
+
+    # Bound the registered handler, excluding unrelated native CLI startup time.
+    previous = signal.signal(signal.SIGALRM, deadline)
+    signal.setitimer(signal.ITIMER_REAL, 3)
+    try:
+        result = native.query("delivery_policy_check")
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+    assert not expired, "policy query blocked until its deadline"
+    assert result["ok"]
+    assert result["policy"] == {"state": "invalid", "diagnostics": ["policy_not_regular"]}
+    assert native.policy.stat().st_mode == mode
 
 
 def test_profile_allowlist_and_bound_home(native, monkeypatch, tmp_path):

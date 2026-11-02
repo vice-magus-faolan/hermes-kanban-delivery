@@ -23,6 +23,9 @@ hermes delivery context --board project --task-id t_example
 Enable the `kanban_delivery` toolset in the selected profile to expose model tools
 `delivery_policy_check` and `delivery_context`. They accept only `board` and,
 for context, `task_id`; they use exactly the same query handlers as the CLI.
+The no-write guarantee applies to these query handlers and their store
+observation, not the complete Hermes CLI process: native CLI startup can write
+logs and bootstrap files in the selected Hermes home before invoking a handler.
 Outside a verified active worker, board selection is mandatory, even if a current
 board is configured. A verified worker may omit its own board/task; cross-board
 or cross-task requests, incomplete pins and stale/foreign actor pins are refused.
@@ -71,8 +74,10 @@ changes configuration/current board or installs enforcement hooks.
 
 ## Limits and compatibility adapter
 
-Policy input is capped at 1 MiB. Each task query reads at most 128 runs and 512
-relevant lifecycle events, with 64 KiB per metadata/payload field and a bounded
+Policy input must be a regular file and is capped at 1 MiB; FIFOs and other
+nonregular inputs are refused without waiting for a writer. Each task query reads
+at most 128 runs and 512 relevant lifecycle events, with 64 KiB per
+metadata/payload field and a bounded
 SQLite work budget. Larger/incomplete history is explicitly unknown, never a
 truncated history presented as complete. Encoded replies are capped at 32 KiB;
 `response_limit` refuses an oversized result instead of silently truncating an
@@ -85,9 +90,12 @@ a narrow read-only SQLite compatibility adapter for the two tested release
 schemas. It uses task-local parameterized SELECTs in one snapshot, `mode=ro` and
 `query_only`, without schema repair or lifecycle SQL writes. Native profile/root
 and dispatcher-ownership helpers retain their existing scope semantics. Schema
-changes require re-verification. A WAL store missing its shared-memory sidecar is
-refused rather than repaired; normal SQLite reader locking is not application
-state mutation. Unavailable stores are not created. Operator control of native
+changes require re-verification. WAL stores require both existing `-wal` and
+`-shm` files, including on the first query after a clean writer close; missing
+sidecars cause `store_sidecars_unavailable`, never creation or repair. Healthy
+live WAL reads include committed WAL-only data; normal SQLite reader locking is
+not application state mutation. DELETE-mode stores need no sidecars.
+Unavailable stores are not created. Operator control of native
 homes/pins is trusted; this is not an OS sandbox against arbitrary installed code.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the canonical container/CI checks.
