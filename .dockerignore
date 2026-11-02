@@ -1,0 +1,9 @@
+**
+!docker/
+!docker/Dockerfile
+!requirements-test.txt
+!.dockerignore
+!plugin.yaml
+!__init__.py
+!delivery/
+!delivery/*.py
