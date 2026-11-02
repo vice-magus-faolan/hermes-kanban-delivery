@@ -5,6 +5,7 @@ image=${DELIVERY_TEST_IMAGE:-hermes-kanban-delivery:v0.22.5}
 run="kanban-delivery-$(date +%s%N)-$$"
 label="org.hermes-kanban-delivery.run=$run"
 staging=''
+docker_pid=''
 cleanup() {
     result=$?
     trap - EXIT INT TERM
@@ -13,6 +14,12 @@ cleanup() {
         remaining=$(docker ps -aq --filter "name=^/${run}$") || cleanup_status=1
         if [[ -n ${remaining:-} ]]; then cleanup_status=1; fi
     }
+    if [[ -n $docker_pid ]]; then
+        # Do not hang on the client if removal failed; resource queries still fail closed.
+        kill "$docker_pid" 2>/dev/null || true
+        # Its status must not replace the saved test/signal exit.
+        wait "$docker_pid" 2>/dev/null || true
+    fi
     for resource in container volume network; do
         case $resource in
             container) remaining=$(docker ps -aq --filter "label=$label") || cleanup_status=1 ;;
@@ -62,10 +69,13 @@ done < "$staging/inputs"
 for required in __init__.py plugin.yaml delivery/service.py scripts/verify.sh tests/test_native.py; do
     test -f "$staging/source/$required"
 done
-chmod -R a+rX "$staging"
+chmod -R a+rX "$staging/source"
 if [[ $# -eq 0 ]]; then set -- bash scripts/verify.sh; fi
 docker run --rm --name "$run" --label "$label" --network none \
     --read-only --user 65532:65532 --cap-drop ALL --security-opt no-new-privileges \
     --cpus 2 --memory 2g --pids-limit 256 \
     --tmpfs /scratch:rw,nosuid,nodev,size=512m,mode=1777 \
-    --mount "type=bind,src=$staging/source,dst=/source,readonly" "$image" "$@"
+    --mount "type=bind,src=$staging/source,dst=/source,readonly" "$image" "$@" &
+docker_pid=$!
+# Bash defers traps during a foreground external command, but interrupts wait.
+wait "$docker_pid"
