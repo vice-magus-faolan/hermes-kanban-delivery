@@ -1,0 +1,13 @@
+name: kanban-delivery
+version: 0.1.0
+kind: standalone
+description: "Read-only selected-board delivery policy and native artifact context."
+author: Hermes Kanban Delivery contributors
+license: GPL-3.0-or-later
+platforms:
+  - linux
+requires_hermes: ">=0.22.2,<0.23.0"
+python_dependencies: []
+provides_tools:
+  - delivery_policy_check
+  - delivery_context

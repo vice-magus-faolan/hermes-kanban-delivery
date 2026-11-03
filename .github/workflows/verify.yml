@@ -1,0 +1,30 @@
+name: verify
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  verify:
+    name: verify (${{ matrix.hermes }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        hermes: [v0.22.2, v0.22.5]
+    env:
+      DELIVERY_TEST_IMAGE: hermes-kanban-delivery:${{ matrix.hermes }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build stock locked runtime and admit plugin online
+        run: docker build --build-arg HERMES_REF=${{ matrix.hermes }} -t "$DELIVERY_TEST_IMAGE" -f docker/Dockerfile .
+      - name: Verify native queries and boundaries without networking
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: bash scripts/verify-docker.sh
+      - name: Verify real Docker input privacy and failure cleanup
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: python3 scripts/test-docker-inputs.py
