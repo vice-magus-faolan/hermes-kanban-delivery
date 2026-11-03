@@ -81,18 +81,25 @@ def database_path(home: Path, board: str) -> Path:
 
 @contextmanager
 def snapshot(filename: Path):
+    from hermes_cli.sqlite_safe_read import connect_tracked, read_header_bytes_preopen
+
     if not filename.is_file():
         raise QueryError("store_missing")
-    # mode=ro can create BOTH sidecars for a cleanly closed WAL database.
-    # SQLite's persisted read/write format bytes (18/19) identify WAL even
-    # when neither sidecar exists; never open an incomplete WAL store for it.
-    with filename.open("rb") as stream:
-        wal_mode = 2 in stream.read(20)[18:20]
     wal = filename.with_name(filename.name + "-wal")
     shm = filename.with_name(filename.name + "-shm")
-    if (wal_mode or wal.exists() or shm.exists()) and not (wal.is_file() and shm.is_file()):
-        raise QueryError("store_sidecars_unavailable")
-    with closing(sqlite3.connect(filename.as_uri() + "?mode=ro", uri=True, timeout=1)) as conn:
+    # Complete existing WAL sidecars need no byte probe. Otherwise mode=ro
+    # could create them: require safe evidence of DELETE format before opening.
+    if not (wal.is_file() and shm.is_file()):
+        if wal.exists() or shm.exists():
+            raise QueryError("store_sidecars_unavailable")
+        header = read_header_bytes_preopen(filename, length=20)
+        if header is None or len(header) < 20:
+            raise QueryError("store_header_unavailable")
+        if header[18:20] != b"\x01\x01":
+            raise QueryError("store_sidecars_unavailable")
+    # Native tracking also protects this reader from other in-process probes.
+    with closing(connect_tracked(filename.as_uri() + "?mode=ro", tracking_path=filename,
+                                 uri=True, timeout=1)) as conn:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA query_only=ON")
         # Bound corrupt/unindexed-store work; no retries or migrations.

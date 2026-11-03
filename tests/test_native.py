@@ -8,12 +8,12 @@ import os
 from pathlib import Path
 import shutil
 import signal
-import sqlite3
 import subprocess
 import sys
 
 import pytest
 from hermes_cli.kanban_db_connect import connect
+from hermes_cli.sqlite_safe_read import connect_tracked
 
 ROOT = Path(__file__).resolve().parents[1]
 SHA = "a" * 40
@@ -172,6 +172,7 @@ def test_native_phase_and_cli_share_handler(native, stage):
         native.claim()
     if stage == "completed":
         native.complete()
+    native.conn.close()
     result = native.query()
     assert result["ok"], result
     view = result["context"]
@@ -190,11 +191,14 @@ def test_native_phase_and_cli_share_handler(native, stage):
 def test_pending_and_returned_owner(native):
     native.claim()
     native.handoff()
+    native.conn.close()
     view = native.query()["context"]
     assert view["phase"] == "awaiting_reviewer"
     assert view["next_owner"] == "reviewer"
+    native.conn = connect(board=native.board)
     native.claim(review=True)
     assert native.kb.request_changes(native.conn, native.task, reason="Synthetic rework", expected_run_id=native.run)[0]
+    native.conn.close()
     view = native.query()["context"]
     assert view["phase"] == "returned_builder"
     assert view["next_owner"] == "builder"
@@ -257,6 +261,7 @@ def test_untrusted_review_is_not_approval(native, reviewer, metadata, diagnostic
     native.handoff(reviewer=reviewer)
     native.claim(review=True)
     native.complete(metadata)
+    native.conn.close()
     review = native.query()["context"]["review"]
     assert review["state"] == "invalid"
     assert diagnostic in review["diagnostics"]
@@ -265,6 +270,7 @@ def test_untrusted_review_is_not_approval(native, reviewer, metadata, diagnostic
 def test_completion_status_or_prose_is_not_review(native):
     native.claim()
     native.complete({"commit": SHA, "private": "PRIVATE_METADATA_CANARY"})
+    native.conn.close()
     result = native.query()["context"]
     assert result["phase"] == "completed"
     assert result["artifact"] == {"kind": "git", "commit": SHA}
@@ -278,6 +284,7 @@ def test_report_identity_and_no_file_read(native):
     native.claim(review=True)
     native.complete({"artifact_kind": "report", "reviewed_artifacts": report,
                      "approved": True, "review_outcome": "approved"})
+    native.conn.close()
     view = native.query()["context"]
     assert view["artifact"] == {"kind": "report", "artifacts": report}
     assert view["review"]["state"] == "recorded"
@@ -290,6 +297,7 @@ def test_no_identity_repair_or_guessed_fallback(native, metadata):
     native.claim()
     native.handoff(metadata)
     native.claim(review=True)
+    native.conn.close()
     view = native.query()["context"]
     assert view["artifact"] is None
     assert view["diagnostics"]
@@ -304,6 +312,7 @@ def test_changed_successor_does_not_inherit_approval(native):
     native.handoff({"commit": OTHER})
     native.claim(review=True)
     native.complete({"approved": True, "review_outcome": "approved", "reviewed_commit": SHA})
+    native.conn.close()
     view = native.query()["context"]
     assert view["artifact"]["commit"] == OTHER
     assert view["review"]["state"] == "invalid"
@@ -312,6 +321,7 @@ def test_changed_successor_does_not_inherit_approval(native):
 def test_worker_pin_defaults_and_fences(native, monkeypatch):
     native.claim()
     pin(native, monkeypatch, "builder")
+    native.conn.close()
     from tools.registry import registry
     result = json.loads(registry.dispatch("delivery_context", {}, scope=native.manager.scope_key))
     assert result["context"]["phase"] == "builder"
@@ -340,6 +350,7 @@ def test_default_and_named_boards_no_cross_board_fallback(native):
         task = native.kb.create_task(default, title="Synthetic default", assignee="builder", workspace_kind="dir",
                                       workspace_path="/synthetic/default", board="default")
         native.kb.claim_task(default, task)
+        default.close()
         result = native.query(board="default", task_id=task)
         assert result["context"]["phase"] == "builder"
         assert result["policy"]["state"] == "unconfigured"
@@ -383,7 +394,72 @@ def test_registered_query_has_no_effect_attempts(native):
 
 
 def file_bytes(root):
-    return {str(p.relative_to(root)): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+    # Closing a raw DB/sidecar fd in the holder process would cancel its locks.
+    completed = subprocess.run([sys.executable, "-c", """
+import json
+from pathlib import Path
+import sys
+root = Path(sys.argv[1])
+print(json.dumps({str(p.relative_to(root)): p.read_bytes().hex()
+                  for p in root.rglob("*") if p.is_file()}))
+""", str(root)], text=True, capture_output=True, timeout=10)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    return json.loads(completed.stdout)
+
+
+def probe_write_lock(filename, task_id):
+    # A real independent writer must be valid both before and after the query.
+    completed = subprocess.run([sys.executable, "-c", """
+import json
+import os
+import sqlite3
+import sys
+from hermes_cli.sqlite_safe_read import connect_tracked
+
+conn = connect_tracked(sys.argv[1], timeout=0.1, isolation_level=None)
+try:
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+    except sqlite3.OperationalError as exc:
+        if exc.sqlite_errorcode != sqlite3.SQLITE_BUSY:
+            raise
+        outcome = "locked"
+    else:
+        assert conn.execute("UPDATE tasks SET title=? WHERE id=?",
+                            ("Synthetic rolled-back probe", sys.argv[2])).rowcount == 1
+        outcome = "acquired"
+finally:
+    conn.rollback()
+    conn.close()
+print(json.dumps({"pid": os.getpid(), "outcome": outcome}))
+""", str(filename), task_id], text=True, capture_output=True, timeout=10)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    result = json.loads(completed.stdout)
+    assert result["pid"] != os.getpid()
+    return result["outcome"]
+
+
+@pytest.mark.parametrize("name", ["delivery_context", "delivery_policy_check"])
+def test_query_preserves_same_process_native_write_lock(native, monkeypatch, name):
+    assert native.conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0] == "delete"
+    native.claim()
+    pin(native, monkeypatch, "builder")
+    filename = Path(native.conn.execute("PRAGMA database_list").fetchone()[2])
+    committed = tuple(native.conn.iterdump())
+    native.conn.execute("BEGIN IMMEDIATE")
+    try:
+        native.conn.execute("UPDATE tasks SET title=? WHERE id=?", ("Synthetic pending write", native.task))
+        before = probe_write_lock(filename, native.task)
+        assert before == "locked", "the original transaction did not exclude a valid writer"
+        result = native.query(name)
+        assert native.conn.in_transaction, "the query ended the original holder's transaction"
+        after = probe_write_lock(filename, native.task)
+    finally:
+        native.conn.rollback()
+    released = probe_write_lock(filename, native.task)
+    assert (before, after, released) == ("locked", "locked", "acquired")
+    assert tuple(native.conn.iterdump()) == committed
+    assert result == {"ok": False, "error": "store_header_unavailable"}
 
 
 @pytest.mark.parametrize("mode", ["wal", "delete"])
@@ -406,13 +482,34 @@ def test_first_query_preserves_closed_store(native, mode):
         assert result["ok"] and result["context"]["phase"] == "builder"
 
 
+@pytest.mark.parametrize("kind", ["unreadable", "short"])
+def test_unavailable_header_does_not_guess_or_repair(native, kind):
+    assert native.conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0] == "delete"
+    native.claim()
+    filename = Path(native.conn.execute("PRAGMA database_list").fetchone()[2])
+    native.conn.close()
+    if kind == "short":
+        filename.write_bytes(filename.read_bytes()[:19])
+    paths, before = set(native.home.rglob("*")), file_bytes(native.home)
+    mode = filename.stat().st_mode
+    if kind == "unreadable":
+        filename.chmod(0)
+    try:
+        result = native.query()
+    finally:
+        filename.chmod(mode)
+    assert result == {"ok": False, "error": "store_header_unavailable"}
+    assert set(native.home.rglob("*")) == paths
+    assert file_bytes(native.home) == before
+
+
 def test_live_wal_reads_committed_wal_only_state(native):
     assert native.conn.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
     assert native.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0] == 0
     filename = Path(native.conn.execute("PRAGMA database_list").fetchone()[2])
-    main_before = filename.read_bytes()
+    main_before = file_bytes(filename.parent)[filename.name]
     # An actual reader pins the pre-claim snapshot while the native writer commits.
-    reader = sqlite3.connect(filename)
+    reader = connect_tracked(filename)
     try:
         reader.execute("BEGIN")
         old_status = reader.execute("SELECT status FROM tasks WHERE id=?", (native.task,)).fetchone()[0]
@@ -421,13 +518,17 @@ def test_live_wal_reads_committed_wal_only_state(native):
         wal = filename.with_name(filename.name + "-wal")
         shm = filename.with_name(filename.name + "-shm")
         assert wal.is_file() and shm.is_file() and wal.stat().st_size > 32
-        assert filename.read_bytes() == main_before
-        wal_before, paths = wal.read_bytes(), set(filename.parent.iterdir())
+        before = file_bytes(filename.parent)
+        assert before[filename.name] == main_before
+        committed = tuple(native.conn.iterdump())
+        paths = set(filename.parent.iterdir())
         result = native.query()
         assert result["ok"] and result["context"]["phase"] == "builder", result
         assert result["context"]["run_id"] == native.run
         assert reader.execute("SELECT status FROM tasks WHERE id=?", (native.task,)).fetchone()[0] == old_status
-        assert filename.read_bytes() == main_before and wal.read_bytes() == wal_before
+        after = file_bytes(filename.parent)
+        assert after[filename.name] == main_before and after[wal.name] == before[wal.name]
+        assert tuple(native.conn.iterdump()) == committed
         assert set(filename.parent.iterdir()) == paths
     finally:
         reader.close()
@@ -439,7 +540,7 @@ def test_partial_wal_sidecars_are_not_repaired(native, remaining):
     native.claim()
     filename = Path(native.conn.execute("PRAGMA database_list").fetchone()[2])
     sidecars = {kind: filename.with_name(filename.name + "-" + kind) for kind in ("wal", "shm")}
-    retained = sidecars[remaining].read_bytes()
+    retained = bytes.fromhex(file_bytes(filename.parent)[sidecars[remaining].name])
     native.conn.close()
     assert all(not path.exists() for path in sidecars.values())
     # Re-create one native-produced sidecar only after the owned writer closes.
@@ -454,6 +555,7 @@ def test_partial_wal_sidecars_are_not_repaired(native, remaining):
 @pytest.mark.parametrize("name", ["delivery_policy_check", "delivery_context"])
 def test_symlink_policy_is_refused_with_valid_native_state(native, name):
     native.claim()
+    native.conn.close()
     assert native.query(name)["ok"]
     target = native.policy.with_name("retained-policy.json")
     native.policy.rename(target)
@@ -466,9 +568,9 @@ def test_symlink_policy_is_refused_with_valid_native_state(native, name):
 @pytest.mark.parametrize("linked", ["database", "board"])
 def test_symlink_board_is_refused_with_valid_native_state(native, linked):
     native.claim()
-    assert native.query()["ok"]
     filename = Path(native.conn.execute("PRAGMA database_list").fetchone()[2])
     native.conn.close()
+    assert native.query()["ok"]
     original = filename if linked == "database" else filename.parent
     target = original.with_name("retained-" + original.name)
     original.rename(target)
@@ -529,12 +631,14 @@ def test_event_tail_does_not_hide_claim(native):
     # Genuine native events exceed kanban_show's event tail, without hiding claim.
     for index in range(60):
         native.kb.add_comment(native.conn, native.task, author="builder", body="PRIVATE_COMMENT_CANARY")
+    native.conn.close()
     assert native.query()["context"]["phase"] == "builder"
 
 
 def test_native_manual_completion_has_incomplete_claim_history(native):
     assert native.kb.complete_task(native.conn, native.task, summary="Synthetic operator completion",
                                     metadata={"commit": SHA})
+    native.conn.close()
     view = native.query()["context"]
     assert view["artifact"] is None
     assert "completion_provenance_missing" in view["diagnostics"]
@@ -548,6 +652,7 @@ def test_bounded_native_history(native):
         native.claim(review=True)
         assert native.kb.request_changes(native.conn, native.task, reason="Synthetic rework", expected_run_id=native.run)[0]
         native.claim()
+    native.conn.close()
     view = native.query()["context"]
     assert view["phase"] == "unknown"
     assert view["artifact"] is None

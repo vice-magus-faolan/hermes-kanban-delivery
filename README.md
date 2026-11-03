@@ -2,6 +2,31 @@
 
 Read-only delivery observations for native Hermes Kanban. GPL-3.0-or-later.
 
+## Storage support: read before installing
+
+Runtime compatibility is not blanket WAL-mode board support. Ordinary native WAL
+boards are not reliably supported by this reader: CLI and dispatcher-tick
+connections can close and leave no sidecars. Reads with both existing `-wal` and
+`-shm` files can succeed, including committed WAL-only data, but that opportunistic
+success is not a dependable normal WAL workflow. A general safe WAL reader is
+not implemented in this release.
+
+`store_sidecars_unavailable` means the reader cannot safely open the board
+without possibly creating or repairing WAL sidecars, so it returns no observation.
+`store_header_unavailable` means required journal-format evidence cannot be read
+safely, including when another tracked native connection is live in this process
+or the header is unreadable/incomplete. Neither error establishes that a task is
+missing or its policy invalid. DELETE-mode reads work when safe header evidence
+is available; the plugin never forces a probe or closes another caller's handle.
+
+For an operator who accepts ordinary native store handling and full task-content
+disclosure, use `hermes kanban --board project show t_example` instead. That native
+view is not the plugin's bounded delivery projection or no-write interface: it
+can initialize/migrate stores and write startup files. If those effects are not
+acceptable, leave the plugin result unavailable. Do not alter journal mode,
+manipulate sidecars or live board files, or hold artificial connections open to
+make a query succeed.
+
 ## Install and query
 
 This is a native directory plugin with no third-party Python runtime dependencies.
@@ -90,11 +115,12 @@ a narrow read-only SQLite compatibility adapter for the two tested release
 schemas. It uses task-local parameterized SELECTs in one snapshot, `mode=ro` and
 `query_only`, without schema repair or lifecycle SQL writes. Native profile/root
 and dispatcher-ownership helpers retain their existing scope semantics. Schema
-changes require re-verification. WAL stores require both existing `-wal` and
-`-shm` files, including on the first query after a clean writer close; missing
-sidecars cause `store_sidecars_unavailable`, never creation or repair. Healthy
-live WAL reads include committed WAL-only data; normal SQLite reader locking is
-not application state mutation. DELETE-mode stores need no sidecars.
+changes require re-verification. Query connections use native lifecycle tracking;
+required header reads use the native safe-read facility and fail closed when
+evidence is unavailable. The storage-support limitations above apply even on
+the tested runtimes. Normal SQLite reader locking is not application state
+mutation. Sidecar checks and SQLite open are not atomic against other processes
+changing journal mode or removing sidecars.
 Unavailable stores are not created. Operator control of native
 homes/pins is trusted; this is not an OS sandbox against arbitrary installed code.
 
