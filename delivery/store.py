@@ -81,23 +81,13 @@ def database_path(home: Path, board: str) -> Path:
 
 @contextmanager
 def snapshot(filename: Path):
-    from hermes_cli.sqlite_safe_read import connect_tracked, read_header_bytes_preopen
+    from hermes_cli.sqlite_safe_read import connect_tracked
 
     if not filename.is_file():
         raise QueryError("store_missing")
-    wal = filename.with_name(filename.name + "-wal")
-    shm = filename.with_name(filename.name + "-shm")
-    # Complete existing WAL sidecars need no byte probe. Otherwise mode=ro
-    # could create them: require safe evidence of DELETE format before opening.
-    if not (wal.is_file() and shm.is_file()):
-        if wal.exists() or shm.exists():
-            raise QueryError("store_sidecars_unavailable")
-        header = read_header_bytes_preopen(filename, length=20)
-        if header is None or len(header) < 20:
-            raise QueryError("store_header_unavailable")
-        if header[18:20] != b"\x01\x01":
-            raise QueryError("store_sidecars_unavailable")
-    # Native tracking also protects this reader from other in-process probes.
+    # Let SQLite own WAL recovery/bookkeeping. Closing a raw header descriptor
+    # could release locks held by an untracked connection in this process.
+    # Native tracking protects this reader from cooperating in-process probes.
     with closing(connect_tracked(filename.as_uri() + "?mode=ro", tracking_path=filename,
                                  uri=True, timeout=1)) as conn:
         conn.row_factory = sqlite3.Row

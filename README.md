@@ -4,28 +4,36 @@ Read-only delivery observations for native Hermes Kanban. GPL-3.0-or-later.
 
 ## Storage support: read before installing
 
-Runtime compatibility is not blanket WAL-mode board support. Ordinary native WAL
-boards are not reliably supported by this reader: CLI and dispatcher-tick
-connections can close and leave no sidecars. Reads with both existing `-wal` and
-`-shm` files can succeed, including committed WAL-only data, but that opportunistic
-success is not a dependable normal WAL workflow. A general safe WAL reader is
-not implemented in this release.
+Queries support native WAL and DELETE stores, including a first read after normal
+native connections close and remove WAL sidecars. They read committed state from
+SQLite, including commits still present only in the WAL. No artificial open
+connection or journal-mode change is needed.
 
-`store_sidecars_unavailable` means the reader cannot safely open the board
-without possibly creating or repairing WAL sidecars, so it returns no observation.
-`store_header_unavailable` means required journal-format evidence cannot be read
-safely, including when another tracked native connection is live in this process
-or the header is unreadable/incomplete. Neither error establishes that a task is
-missing or its policy invalid. DELETE-mode reads work when safe header evidence
-is available; the plugin never forces a probe or closes another caller's handle.
+Read-only means application records, schema, persistent settings and automation
+remain unchanged, not that every database-directory byte is immutable. SQLite
+owns ordinary reader bookkeeping: it may create/reconstruct `-wal` and `-shm`,
+update the shared WAL index and leave sidecars after the reader closes. A closed
+WAL store can acquire an empty WAL and a SHM file on its first read. The plugin
+does not edit sidecars itself, checkpoint, initialize/migrate stores, change
+journal mode or repair application data. If even SQLite-managed bookkeeping is
+unacceptable, do not invoke these queries.
 
-For an operator who accepts ordinary native store handling and full task-content
-disclosure, use `hermes kanban --board project show t_example` instead. That native
-view is not the plugin's bounded delivery projection or no-write interface: it
-can initialize/migrate stores and write startup files. If those effects are not
-acceptable, leave the plugin result unavailable. Do not alter journal mode,
-manipulate sidecars or live board files, or hold artificial connections open to
-make a query succeed.
+The database must be readable. Missing WAL/SHM files generally require directory
+write permission; shared-memory access may also require writable SHM. Existing
+sidecars can permit read-only access under SQLite's own rules, but that is not
+guaranteed for every filesystem or recovery state. Filesystems must support
+SQLite's locking/shared-memory requirements; WAL is not a network-filesystem
+coordination protocol.
+
+`store_missing` means no regular existing store was found; the plugin creates
+nothing in that case. `native_store_unavailable` covers unreadable/corrupt stores,
+unavailable bookkeeping/recovery or lock contention. It does not mean a task is
+missing or its policy invalid. There are no header/sidecar-evidence error guesses.
+SQLite can rebuild missing SHM from valid committed WAL, but SHM cannot restore
+missing WAL commits. Concurrent sidecar removal, hostile path manipulation,
+journal changes and arbitrary recovery schedules are not guaranteed safe or
+available. Leave unavailable results unresolved; do not manipulate live board
+files or force a journal change to make an observation succeed.
 
 ## Install and query
 
@@ -48,8 +56,8 @@ hermes delivery context --board project --task-id t_example
 Enable the `kanban_delivery` toolset in the selected profile to expose model tools
 `delivery_policy_check` and `delivery_context`. They accept only `board` and,
 for context, `task_id`; they use exactly the same query handlers as the CLI.
-The no-write guarantee applies to these query handlers and their store
-observation, not the complete Hermes CLI process: native CLI startup can write
+The application-read-only boundary and SQLite bookkeeping exception apply to
+these query handlers, not the complete Hermes CLI process: native CLI startup can write
 logs and bootstrap files in the selected Hermes home before invoking a handler.
 Outside a verified active worker, board selection is mandatory, even if a current
 board is configured. A verified worker may omit its own board/task; cross-board
@@ -115,12 +123,16 @@ a narrow read-only SQLite compatibility adapter for the two tested release
 schemas. It uses task-local parameterized SELECTs in one snapshot, `mode=ro` and
 `query_only`, without schema repair or lifecycle SQL writes. Native profile/root
 and dispatcher-ownership helpers retain their existing scope semantics. Schema
-changes require re-verification. Query connections use native lifecycle tracking;
-required header reads use the native safe-read facility and fail closed when
-evidence is unavailable. The storage-support limitations above apply even on
-the tested runtimes. Normal SQLite reader locking is not application state
-mutation. Sidecar checks and SQLite open are not atomic against other processes
-changing journal mode or removing sidecars.
+changes require re-verification. Query connections use native lifecycle tracking
+and close only their own handle. No raw database/header/sidecar descriptor is
+opened, avoiding process-wide raw-close lock loss for both tracked and plain
+same-process SQLite holders. Tracking protects the query's own lifetime from
+cooperating native probes; it cannot control unrelated raw I/O by other code.
+Each snapshot has a one-second SQLite lock wait and a bounded progress budget;
+there are no retries. A pinned worker's policy validation and final context use
+separate snapshots and revalidate identity, not one atomic policy/context view.
+Normal reader locking and the documented WAL/SHM bookkeeping are not application
+state mutation. The filesystem/concurrency limitations above still apply.
 Unavailable stores are not created. Operator control of native
 homes/pins is trusted; this is not an OS sandbox against arbitrary installed code.
 

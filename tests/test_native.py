@@ -3,17 +3,19 @@
 from __future__ import annotations
 
 import contextvars
+from contextlib import closing
 import json
 import os
 from pathlib import Path
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 
 import pytest
 from hermes_cli.kanban_db_connect import connect
-from hermes_cli.sqlite_safe_read import connect_tracked
+from hermes_cli.sqlite_safe_read import connect_tracked, has_live_connection
 
 ROOT = Path(__file__).resolve().parents[1]
 SHA = "a" * 40
@@ -88,10 +90,15 @@ class Native:
         self.board = "project"
         kb.create_board(self.board)
         self.conn = connect(board=self.board)
+        # Never force WAL around the native runtime's safety decision.
+        assert self.conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
         self.task = kb.create_task(self.conn, title="PRIVATE_TITLE_CANARY", body="PRIVATE_BODY_CANARY",
                                    assignee="builder", workspace_kind="dir", workspace_path="/synthetic/lane",
                                    board=self.board)
         kb.add_comment(self.conn, self.task, author="builder", body="PRIVATE_COMMENT_CANARY")
+        self.foreign = kb.create_task(self.conn, title="PRIVATE_FOREIGN_TASK_CANARY", assignee="outsider",
+                                      workspace_kind="dir", workspace_path="/synthetic/foreign", board=self.board)
+        kb.add_comment(self.conn, self.foreign, author="outsider", body="PRIVATE_FOREIGN_HISTORY_CANARY")
         self.write_policy(git_policy())
 
     def write_policy(self, config, extra=None):
@@ -159,6 +166,17 @@ def pin(native, monkeypatch, actor):
     monkeypatch.setenv("HERMES_KANBAN_DB", str(native.home / "kanban" / "boards" / native.board / "kanban.db"))
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(native.run))
     monkeypatch.setenv("HERMES_PROFILE_NAME", actor)
+
+
+def test_native_safe_wal_runtime(native, capsys):
+    from hermes_cli.sqlite_runtime import is_sqlite_wal_reset_vulnerable
+
+    assert not is_sqlite_wal_reset_vulnerable(sqlite3.sqlite_version_info)
+    assert os.getuid() == 65532
+    assert native.conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+    with capsys.disabled():
+        print(f"\nNative runtime: Python {sys.version.split()[0]}, SQLite {sqlite3.sqlite_version}, "
+              f"executable={sys.executable}, uid={os.getuid()}, journal=wal")
 
 
 @pytest.mark.parametrize("stage", ["builder", "reviewer", "returned_builder", "completed"])
@@ -377,9 +395,9 @@ def test_registered_query_has_no_effect_attempts(native):
     native.handoff()
     native.claim(review=True)
     native.complete()
+    filename = Path(native.conn.execute("PRAGMA database_list").fetchone()[2])
+    committed = tuple(native.conn.iterdump())
     native.conn.close()
-    # Prime lazy native registry/config imports before observing the query itself.
-    expected = native.query()
     before = file_bytes(native.home)
     attempted = []
     token = AUDIT.set(attempted)
@@ -388,9 +406,11 @@ def test_registered_query_has_no_effect_attempts(native):
         policy = native.query("delivery_policy_check")
     finally:
         AUDIT.reset(token)
-    assert result == expected and policy["ok"]
+    assert result["ok"] and result["context"]["review"]["state"] == "recorded" and policy["ok"]
     assert attempted == []
-    assert file_bytes(native.home) == before
+    after = file_bytes(native.home)
+    assert non_database_files(after, native.home, filename) == non_database_files(before, native.home, filename)
+    assert logical_state(filename) == committed
 
 
 def file_bytes(root):
@@ -405,6 +425,19 @@ print(json.dumps({str(p.relative_to(root)): p.read_bytes().hex()
 """, str(root)], text=True, capture_output=True, timeout=10)
     assert completed.returncode == 0, completed.stdout + completed.stderr
     return json.loads(completed.stdout)
+
+
+def non_database_files(files, root, filename):
+    relative = str(filename.relative_to(root))
+    database_files = {relative + suffix for suffix in ("", "-wal", "-shm", "-journal")}
+    return {name: value for name, value in files.items() if name not in database_files}
+
+
+def logical_state(filename):
+    with closing(sqlite3.connect(filename.as_uri() + "?mode=ro", uri=True)) as conn:
+        conn.execute("PRAGMA query_only=ON")
+        conn.execute("BEGIN")
+        return tuple(conn.iterdump())
 
 
 def probe_write_lock(filename, task_id):
@@ -440,11 +473,19 @@ print(json.dumps({"pid": os.getpid(), "outcome": outcome}))
 
 
 @pytest.mark.parametrize("name", ["delivery_context", "delivery_policy_check"])
-def test_query_preserves_same_process_native_write_lock(native, monkeypatch, name):
-    assert native.conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0] == "delete"
+@pytest.mark.parametrize("owner", ["tracked", "plain"])
+@pytest.mark.parametrize("mode", ["wal", "delete"])
+def test_query_preserves_same_process_write_lock(native, monkeypatch, name, owner, mode):
+    if mode == "delete":
+        assert native.conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0] == "delete"
     native.claim()
     pin(native, monkeypatch, "builder")
     filename = Path(native.conn.execute("PRAGMA database_list").fetchone()[2])
+    if owner == "plain":
+        native.conn.close()
+        assert not has_live_connection(filename), "a tracked pin would hide the entirely plain topology"
+        native.conn = sqlite3.connect(filename)
+    assert has_live_connection(filename) == (owner == "tracked")
     committed = tuple(native.conn.iterdump())
     native.conn.execute("BEGIN IMMEDIATE")
     try:
@@ -453,43 +494,63 @@ def test_query_preserves_same_process_native_write_lock(native, monkeypatch, nam
         assert before == "locked", "the original transaction did not exclude a valid writer"
         result = native.query(name)
         assert native.conn.in_transaction, "the query ended the original holder's transaction"
+        assert native.conn.execute("SELECT title FROM tasks WHERE id=?", (native.task,)).fetchone()[0] == "Synthetic pending write"
         after = probe_write_lock(filename, native.task)
     finally:
         native.conn.rollback()
     released = probe_write_lock(filename, native.task)
     assert (before, after, released) == ("locked", "locked", "acquired")
     assert tuple(native.conn.iterdump()) == committed
-    assert result == {"ok": False, "error": "store_header_unavailable"}
+    assert has_live_connection(filename) == (owner == "tracked")
+    assert result["ok"], result
+    if name == "delivery_context":
+        assert result["context"]["phase"] == "builder"
+        assert result["context"]["run_id"] == native.run
 
 
 @pytest.mark.parametrize("mode", ["wal", "delete"])
-def test_first_query_preserves_closed_store(native, mode):
-    assert native.conn.execute("PRAGMA journal_mode=" + mode).fetchone()[0].lower() == mode
+@pytest.mark.parametrize("name", ["delivery_context", "delivery_policy_check"])
+def test_first_query_preserves_closed_store(native, monkeypatch, mode, name):
+    if mode == "delete":
+        assert native.conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0] == "delete"
     native.claim()
+    pin(native, monkeypatch, "builder")
     filename = Path(native.conn.execute("PRAGMA database_list").fetchone()[2])
+    committed = tuple(native.conn.iterdump())
     native.conn.close()
     assert filename.read_bytes()[18:20] == (b"\x02\x02" if mode == "wal" else b"\x01\x01")
     assert not filename.with_name(filename.name + "-wal").exists()
     assert not filename.with_name(filename.name + "-shm").exists()
     # No priming query: both membership and bytes precede the first public read.
     paths, before = set(native.home.rglob("*")), file_bytes(native.home)
-    result = native.query()
-    assert set(native.home.rglob("*")) == paths
-    assert file_bytes(native.home) == before
-    if mode == "wal":
-        assert result == {"ok": False, "error": "store_sidecars_unavailable"}
-    else:
-        assert result["ok"] and result["context"]["phase"] == "builder"
+    attempted = []
+    token = AUDIT.set(attempted)
+    try:
+        result = native.query(name)
+    finally:
+        AUDIT.reset(token)
+    assert result["ok"], result
+    assert attempted == []
+    after = file_bytes(native.home)
+    assert non_database_files(after, native.home, filename) == non_database_files(before, native.home, filename)
+    if mode == "delete":
+        assert set(native.home.rglob("*")) == paths and after == before
+    assert logical_state(filename) == committed
+    view = native.query()["context"]
+    assert view["phase"] == "builder" and view["run_id"] == native.run
 
 
-@pytest.mark.parametrize("kind", ["unreadable", "short"])
-def test_unavailable_header_does_not_guess_or_repair(native, kind):
+@pytest.mark.parametrize("kind", ["unreadable", "short", "invalid_format"])
+def test_unavailable_store_does_not_guess_or_repair(native, kind):
     assert native.conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0] == "delete"
     native.claim()
     filename = Path(native.conn.execute("PRAGMA database_list").fetchone()[2])
     native.conn.close()
     if kind == "short":
         filename.write_bytes(filename.read_bytes()[:19])
+    elif kind == "invalid_format":
+        original = filename.read_bytes()
+        filename.write_bytes(b"not a database!!" + original[16:])
     paths, before = set(native.home.rglob("*")), file_bytes(native.home)
     mode = filename.stat().st_mode
     if kind == "unreadable":
@@ -498,13 +559,13 @@ def test_unavailable_header_does_not_guess_or_repair(native, kind):
         result = native.query()
     finally:
         filename.chmod(mode)
-    assert result == {"ok": False, "error": "store_header_unavailable"}
+    assert result == {"ok": False, "error": "native_store_unavailable"}
     assert set(native.home.rglob("*")) == paths
     assert file_bytes(native.home) == before
 
 
 def test_live_wal_reads_committed_wal_only_state(native):
-    assert native.conn.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    assert native.conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
     assert native.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0] == 0
     filename = Path(native.conn.execute("PRAGMA database_list").fetchone()[2])
     main_before = file_bytes(filename.parent)[filename.name]
@@ -535,9 +596,10 @@ def test_live_wal_reads_committed_wal_only_state(native):
 
 
 @pytest.mark.parametrize("remaining", ["wal", "shm"])
-def test_partial_wal_sidecars_are_not_repaired(native, remaining):
-    assert native.conn.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+def test_partial_wal_sidecars_preserve_committed_state(native, remaining):
+    assert native.conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
     native.claim()
+    committed = tuple(native.conn.iterdump())
     filename = Path(native.conn.execute("PRAGMA database_list").fetchone()[2])
     sidecars = {kind: filename.with_name(filename.name + "-" + kind) for kind in ("wal", "shm")}
     retained = bytes.fromhex(file_bytes(filename.parent)[sidecars[remaining].name])
@@ -545,11 +607,74 @@ def test_partial_wal_sidecars_are_not_repaired(native, remaining):
     assert all(not path.exists() for path in sidecars.values())
     # Re-create one native-produced sidecar only after the owned writer closes.
     sidecars[remaining].write_bytes(retained)
-    paths, before = set(native.home.rglob("*")), file_bytes(native.home)
+    before = file_bytes(native.home)
     result = native.query()
-    assert set(native.home.rglob("*")) == paths
-    assert file_bytes(native.home) == before
-    assert result == {"ok": False, "error": "store_sidecars_unavailable"}
+    assert result["ok"] and result["context"]["run_id"] == native.run, result
+    after = file_bytes(native.home)
+    assert non_database_files(after, native.home, filename) == non_database_files(before, native.home, filename)
+    assert logical_state(filename) == committed
+
+
+@pytest.mark.parametrize("name", ["delivery_context", "delivery_policy_check"])
+def test_wal_only_native_claim_is_not_lost(native, monkeypatch, name):
+    filename = Path(native.conn.execute("PRAGMA database_list").fetchone()[2])
+    native.conn.close()
+    main_before = file_bytes(filename.parent)[filename.name]
+    # Abnormal producer exit retains a committed native claim only in the WAL.
+    # No parent SQLite read may prime recovery or manufacture sidecars first.
+    completed = subprocess.run([sys.executable, "-c", """
+import json
+import os
+import sys
+from hermes_cli import kanban_db as kb
+from hermes_cli.kanban_db_connect import connect
+
+conn = connect(board=sys.argv[1])
+assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+task = kb.claim_task(conn, sys.argv[2])
+assert task is not None
+print(json.dumps({"run_id": task.current_run_id, "dump": list(conn.iterdump())}), flush=True)
+os._exit(0)
+""", native.board, native.task], text=True, capture_output=True, timeout=30)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    produced = json.loads(completed.stdout)
+    native.run = produced["run_id"]
+    pin(native, monkeypatch, "builder")
+    assert file_bytes(filename.parent)[filename.name] == main_before
+    wal, shm = (filename.with_name(filename.name + suffix) for suffix in ("-wal", "-shm"))
+    assert wal.stat().st_size > 32 and shm.is_file()
+    shm.unlink()  # Synthetic partial state, only after the producer has exited.
+    before = file_bytes(native.home)
+    assert not shm.exists() and not has_live_connection(filename)
+    result = native.query(name)
+    assert result["ok"], result
+    after = file_bytes(native.home)
+    assert non_database_files(after, native.home, filename) == non_database_files(before, native.home, filename)
+    assert logical_state(filename) == tuple(produced["dump"])
+    view = native.query()["context"]
+    assert view["phase"] == "builder" and view["run_id"] == native.run
+
+
+def test_closed_wal_requires_bookkeeping_permissions(native):
+    native.claim()
+    filename = Path(native.conn.execute("PRAGMA database_list").fetchone()[2])
+    committed = tuple(native.conn.iterdump())
+    native.conn.close()
+    assert not filename.with_name(filename.name + "-wal").exists()
+    assert not filename.with_name(filename.name + "-shm").exists()
+    before = file_bytes(native.home)
+    file_mode, directory_mode = filename.stat().st_mode, filename.parent.stat().st_mode
+    try:
+        filename.chmod(0o444)
+        filename.parent.chmod(0o555)
+        result = native.query()
+        assert result == {"ok": False, "error": "native_store_unavailable"}
+        assert file_bytes(native.home) == before
+    finally:
+        filename.parent.chmod(directory_mode)
+        filename.chmod(file_mode)
+    assert native.query()["context"]["phase"] == "builder"
+    assert logical_state(filename) == committed
 
 
 @pytest.mark.parametrize("name", ["delivery_policy_check", "delivery_context"])
