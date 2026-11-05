@@ -655,6 +655,91 @@ os._exit(0)
     assert view["phase"] == "builder" and view["run_id"] == native.run
 
 
+@pytest.mark.parametrize("damage", ["healthy", "frame", "header"])
+@pytest.mark.parametrize("name", ["delivery_context", "delivery_policy_check"])
+def test_wal_recovered_snapshot_does_not_certify_complete_history(native, monkeypatch, capsys, damage, name):
+    filename = Path(native.conn.execute("PRAGMA database_list").fetchone()[2])
+    original_tasks = {row[0] for row in native.conn.execute("SELECT id FROM tasks")}
+    main_state = tuple(native.conn.iterdump())
+    native.conn.close()
+    main_before = file_bytes(filename.parent)[filename.name]
+    # Unlike the claim-only fixture, this task, run and event never reach main.
+    # A genuine native writer exits without close/checkpoint, then is retired.
+    completed = subprocess.run([sys.executable, "-c", """
+import json
+import os
+import sys
+from hermes_cli import kanban_db as kb
+from hermes_cli.kanban_db_connect import connect
+
+conn = connect(board=sys.argv[1])
+assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+task_id = kb.create_task(conn, title="PRIVATE_WAL_ONLY_TASK_CANARY", assignee="builder",
+                         workspace_kind="dir", workspace_path="/synthetic/wal-only", board=sys.argv[1])
+task = kb.claim_task(conn, task_id)
+assert task is not None and task.status == "running"
+run_id = task.current_run_id
+assert conn.execute("SELECT task_id FROM task_runs WHERE id=?", (run_id,)).fetchone()[0] == task_id
+assert conn.execute("SELECT run_id FROM task_events WHERE task_id=? AND kind='claimed'",
+                    (task_id,)).fetchone()[0] == run_id
+print(json.dumps({"task_id": task_id, "run_id": run_id, "dump": list(conn.iterdump())}), flush=True)
+os._exit(0)
+""", native.board], text=True, capture_output=True, timeout=30)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    produced = json.loads(completed.stdout)
+    native.task, native.run = produced["task_id"], produced["run_id"]
+    assert native.task not in original_tasks
+    assert tuple(produced["dump"]) != main_state
+    pin(native, monkeypatch, "builder")
+    assert not has_live_connection(filename)
+    wal, shm = (filename.with_name(filename.name + suffix) for suffix in ("-wal", "-shm"))
+    assert wal.stat().st_size > 56 and shm.is_file()
+    assert file_bytes(filename.parent)[filename.name] == main_before
+    # Synthetic fixture mutation only: the producer has exited and all owned
+    # connections are closed. No raw descriptor is opened by product queries.
+    if damage != "healthy":
+        damaged = bytearray(wal.read_bytes())
+        offset = 56 if damage == "frame" else 0  # First frame payload or WAL magic.
+        damaged[offset] ^= 1
+        wal.write_bytes(damaged)
+    shm.unlink()
+    before = file_bytes(native.home)
+    assert not shm.exists()
+    result = native.query(name)  # FIRST read: no diagnostic may prime recovery.
+    with closing(connect_tracked(filename.as_uri() + "?mode=ro", tracking_path=filename,
+                                 uri=True, timeout=1)) as conn:
+        conn.execute("PRAGMA query_only=ON")
+        budget = iter(range(2000))
+        conn.set_progress_handler(lambda: 0 if next(budget, None) is not None else 1, 1000)
+        conn.execute("BEGIN")
+        checks = {check: [row[0] for row in conn.execute("PRAGMA " + check)]
+                  for check in ("quick_check", "integrity_check")}
+        visible = conn.execute("SELECT id FROM tasks WHERE id=?", (native.task,)).fetchone() is not None
+        recovered = tuple(conn.iterdump())
+    after = file_bytes(native.home)
+    assert after[str(filename.relative_to(native.home))] == main_before
+    assert after[str(wal.relative_to(native.home))] == before[str(wal.relative_to(native.home))]
+    assert non_database_files(after, native.home, filename) == non_database_files(before, native.home, filename)
+    with capsys.disabled():
+        print(f"\nWAL recovered-snapshot limitation: handler={name}, damage={damage}, result={result}, "
+              f"task_visible={visible}, checks={checks}, "
+              f"equals_known_committed={recovered == tuple(produced['dump'])}, "
+              f"equals_preproducer_main={recovered == main_state}")
+    assert checks == {"quick_check": ["ok"], "integrity_check": ["ok"]}
+    if damage == "healthy":
+        assert visible and recovered == tuple(produced["dump"])
+        assert result["ok"], result
+        view = native.query()["context"]
+        assert view["phase"] == "builder" and view["run_id"] == native.run
+    else:
+        # SQLite can expose the older main snapshot despite known committed WAL
+        # history. This pins the documented limitation, not corruption detection:
+        # task_missing and passing integrity checks cannot certify completeness.
+        assert not visible and recovered == main_state
+        assert recovered != tuple(produced["dump"])
+        assert result == {"ok": False, "error": "task_missing"}
+
+
 def test_closed_wal_requires_bookkeeping_permissions(native):
     native.claim()
     filename = Path(native.conn.execute("PRAGMA database_list").fetchone()[2])

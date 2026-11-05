@@ -4,10 +4,19 @@ Read-only delivery observations for native Hermes Kanban. GPL-3.0-or-later.
 
 ## Storage support: read before installing
 
-Queries support native WAL and DELETE stores, including a first read after normal
-native connections close and remove WAL sidecars. They read committed state from
-SQLite, including commits still present only in the WAL. No artificial open
-connection or journal-mode change is needed.
+Queries support intact native WAL and DELETE stores, including a first read after
+normal native connections close and remove WAL sidecars. They read committed
+state from SQLite, including commits still present only in an intact WAL. No
+artificial open connection or journal-mode change is needed.
+
+WAL support assumes an intact database and committed WAL records. SQLite can
+silently ignore a damaged WAL header or checksum-invalid frame and subsequent
+history, exposing an older internally consistent snapshot. Queries describe that
+recovered snapshot: `task_missing` does not establish authoritative absence after
+suspected corruption. Successful queries, `quick_check` and `integrity_check` do
+not certify complete committed history or detect this loss. Do not use a suspected
+damaged store to establish absence or complete delivery/review history; refer it
+to the store owner without manipulating live sidecars.
 
 Read-only means application records, schema, persistent settings and automation
 remain unchanged, not that every database-directory byte is immutable. SQLite
@@ -18,6 +27,10 @@ does not edit sidecars itself, checkpoint, initialize/migrate stores, change
 journal mode or repair application data. If even SQLite-managed bookkeeping is
 unacceptable, do not invoke these queries.
 
+Run queries as the database owner's OS uid, or as root on supported deployments;
+prefer the owner's uid. This is not advice to grant root or broaden permissions.
+A different uid with directory write access can create sidecars owned by that uid
+with `0644` permissions that prevent the database owner from writing.
 The database must be readable. Missing WAL/SHM files generally require directory
 write permission; shared-memory access may also require writable SHM. Existing
 sidecars can permit read-only access under SQLite's own rules, but that is not
@@ -25,8 +38,10 @@ guaranteed for every filesystem or recovery state. Filesystems must support
 SQLite's locking/shared-memory requirements; WAL is not a network-filesystem
 coordination protocol.
 
-`store_missing` means no regular existing store was found; the plugin creates
-nothing in that case. `native_store_unavailable` covers unreadable/corrupt stores,
+`store_missing` means a regular existing store could not be discovered, including
+when directory-search permissions make the path inaccessible; it does not prove
+that no database or task exists. The plugin creates nothing in that case.
+`native_store_unavailable` covers errors SQLite reports for unreadable/corrupt stores,
 unavailable bookkeeping/recovery or lock contention. It does not mean a task is
 missing or its policy invalid. There are no header/sidecar-evidence error guesses.
 SQLite can rebuild missing SHM from valid committed WAL, but SHM cannot restore

@@ -47,8 +47,12 @@ stock APIs, exercise registered tools and actual CLI adapters, and contrast
 privacy/fences/incomplete or invalid review evidence with valid positives. The
 application-effects check observes attempted process/network/filesystem/SQLite
 effects at the Python audit boundary; SQLite-managed reader WAL/SHM bookkeeping
-is permitted. First-call and partial-sidecar fixtures compare complete committed
-logical history/schema and exact non-database settings, with real foreign history.
+is permitted. Intact-store first-call and partial-sidecar fixtures compare complete
+committed logical history/schema and exact non-database settings, with real foreign
+history. Separate damaged-header/frame contrasts retain independently known
+WAL-only task/run/event history through both public handlers: recovered
+`task_missing` and passing integrity checks document the README's completeness
+limitation, not corruption detection or repair.
 Native WAL preconditions and the actual non-root Python/SQLite runtime are checked
 without forcing WAL around native safety. Lock regressions contrast tracked and
 entirely plain same-process holders in WAL/DELETE modes with independent valid
