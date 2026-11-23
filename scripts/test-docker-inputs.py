@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Real Docker success/failure teardown and ignore-layer negative control.
+"""Real Docker runtime identity, teardown and ignore-layer negative control.
 
 Run on the Docker host, not inside a socket-mounted test container. All fixture
 files and the single wrapper mutation live in a uniquely owned disposable Git
@@ -19,8 +19,9 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def run_wrapper(root, *args, expected):
+def run_wrapper(root, *args, expected, environment=None):
     result = subprocess.run(["bash", "scripts/verify-docker.sh", *args], cwd=root,
+                            env={**os.environ, **(environment or {})},
                             text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
     print(result.stdout, flush=True)
     if result.returncode != expected:
@@ -28,6 +29,20 @@ def run_wrapper(root, *args, expected):
     if "resource cleanup=0; staging cleanup=0" not in result.stdout:
         raise RuntimeError("wrapper did not report successful cleanup")
     return result.stdout
+
+
+def check_runtime_identity(root):
+    """A real supported runtime must not satisfy a different requested target."""
+    selected = os.environ["DELIVERY_EXPECTED_HERMES"]
+    wrong = "v0.22.2" if selected != "v0.22.2" else "v0.23.3"
+    output = run_wrapper(root, expected=1, environment={"DELIVERY_EXPECTED_HERMES": wrong})
+    if "Native runtime mismatch:" not in output or "starting product checks" in output:
+        raise RuntimeError("wrong runtime target did not fail before product checks")
+    for value in ("", selected.removeprefix("v")):
+        output = run_wrapper(root, expected=2, environment={"DELIVERY_EXPECTED_HERMES": value})
+        if "Set DELIVERY_EXPECTED_HERMES" not in output or "starting product checks" in output:
+            raise RuntimeError("missing/malformed target did not fail before product checks")
+    print("Real runtime identity: wrong, missing and malformed targets rejected before product checks.", flush=True)
 
 
 def check_signal(root, scratch, signum):
@@ -117,6 +132,7 @@ def main():
         (root / "tests" / ".privacy-canary.py").write_text("PRIVATE_CANARY = True\n")
         (root / ".env").write_text("PRIVATE_CANARY=True\n")
         subprocess.run(["git", "-C", str(root), "add", "-f", "tests/.privacy-canary.py"], check=True)
+        check_runtime_identity(root)
         check_signal(root, scratch, signal.SIGTERM)
         check_signal(root, scratch, signal.SIGINT)
         command = ("python", "-m", "pytest", "-p", "no:cacheprovider", "-q", "tests/test_inputs.py")
@@ -132,7 +148,7 @@ def main():
         negative = run_wrapper(root, *command, expected=1)
         if "test_selected_mount_excludes_ignored_private_inputs" not in negative:
             raise RuntimeError("ignore-filter negative control did not report the expected failing test")
-    print("Real Docker input boundary: signals, private staging, positive, forced failure, "
+    print("Real Docker input boundary: runtime identity, signals, private staging, positive, forced failure, "
           "ignore-filter mutation rejected; cleanup verified.")
 
 

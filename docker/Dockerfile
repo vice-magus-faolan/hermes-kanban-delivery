@@ -1,8 +1,8 @@
 # Online dependency bootstrap; product execution is network-denied.
 FROM python:3.14.0-slim-bookworm@sha256:9bbb8720ae0a24a6ca8dd678bfdf57818fe70caf54c52a53ec01d8db43405056
-ARG HERMES_REF=v0.22.5
+ARG HERMES_REF=v0.23.3
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates bash && rm -rf /var/lib/apt/lists/*
-RUN case "$HERMES_REF" in v0.22.2|v0.22.5) ;; *) exit 2 ;; esac && \
+RUN case "$HERMES_REF" in v0.22.2|v0.22.5|v0.23.1|v0.23.3) ;; *) exit 2 ;; esac && \
     git clone --depth 1 --branch "$HERMES_REF" https://github.com/NousResearch/hermes-agent.git /opt/hermes && \
     git config --system --add safe.directory /opt/hermes
 COPY requirements-test.txt /opt/requirements-test.txt

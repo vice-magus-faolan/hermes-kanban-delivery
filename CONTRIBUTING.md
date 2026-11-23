@@ -22,16 +22,21 @@ home, credentials, board state or Docker socket is mounted.
 ```sh
 export TMPDIR="$HOME/.cache/kanban-delivery-tests"
 mkdir -p "$TMPDIR"
-export DELIVERY_TEST_IMAGE=hermes-kanban-delivery:v0.22.2
-docker build --build-arg HERMES_REF=v0.22.2 -t "$DELIVERY_TEST_IMAGE" -f docker/Dockerfile .
-bash scripts/verify-docker.sh
-python3 scripts/test-docker-inputs.py
-
-export DELIVERY_TEST_IMAGE=hermes-kanban-delivery:v0.22.5
-docker build --build-arg HERMES_REF=v0.22.5 -t "$DELIVERY_TEST_IMAGE" -f docker/Dockerfile .
+# Select v0.22.2, v0.22.5, v0.23.1 or v0.23.3.
+export DELIVERY_EXPECTED_HERMES=v0.23.3
+export DELIVERY_TEST_IMAGE="hermes-kanban-delivery:$DELIVERY_EXPECTED_HERMES"
+docker build --build-arg HERMES_REF="$DELIVERY_EXPECTED_HERMES" -t "$DELIVERY_TEST_IMAGE" -f docker/Dockerfile .
 bash scripts/verify-docker.sh
 python3 scripts/test-docker-inputs.py
 ```
+
+`DELIVERY_EXPECTED_HERMES` is required for canonical verification: a literal stock
+release tag `vX.Y.Z`, without spaces, prerelease or build suffixes. It comes from
+the caller or CI matrix, never the image's name or baked environment. The wrapper
+forwards it explicitly; the offline verifier reads native runtime identity under
+the test user and requires an exact match before syntax, lint, validate, Doctor
+or pytest. Missing/malformed targets and unavailable or different runtime versions
+fail closed. An image override does not change the requested target.
 
 The canonical wrapper selects regular, nonlinked runtime/test inputs through Git
 and ignore rules, mounts that snapshot read-only and removes its owned staging
@@ -58,11 +63,14 @@ without forcing WAL around native safety. Lock regressions contrast tracked and
 entirely plain same-process holders in WAL/DELETE modes with independent valid
 writers; raw byte observers run in separate processes. `test-docker-inputs.py` exercises the actual wrapper with
 an ignored supported-format canary inside `tests`, verifies forced-failure cleanup,
-and proves that removing ignore filtering makes the regression fail.
+and proves that removing ignore filtering makes the regression fail. It also runs
+the actual canonical verifier against a different valid release target, plus
+missing/malformed targets, and requires refusal before product checks with owned
+cleanup preserved. The matching-target canonical run supplies the positive case.
 
 ## CI and design
 
-The `verify` workflow runs both stock release targets on PRs and on pushes to
+The `verify` workflow runs all four stock release targets on PRs and on pushes to
 main, without duplicate feature-branch push suites. The plugin is one shared
 component: all current product tests are affected by its runtime or verification
 changes, so full PR testing is the conservative impact selection. Hosted results

@@ -13,9 +13,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        hermes: [v0.22.2, v0.22.5]
+        hermes: [v0.22.2, v0.22.5, v0.23.1, v0.23.3]
     env:
       DELIVERY_TEST_IMAGE: hermes-kanban-delivery:${{ matrix.hermes }}
+      DELIVERY_EXPECTED_HERMES: ${{ matrix.hermes }}
     steps:
       - uses: actions/checkout@v4
       - name: Build stock locked runtime and admit plugin online
@@ -24,7 +25,7 @@ jobs:
         env:
           TMPDIR: ${{ runner.temp }}
         run: bash scripts/verify-docker.sh
-      - name: Verify real Docker input privacy and failure cleanup
+      - name: Verify runtime identity, Docker input privacy and failure cleanup
         env:
           TMPDIR: ${{ runner.temp }}
         run: python3 scripts/test-docker-inputs.py
