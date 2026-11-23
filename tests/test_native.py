@@ -357,7 +357,17 @@ def test_unpinned_explicit_board_and_literal_ids(native, monkeypatch):
     for slug in (" project", "Project", "project ", "../project"):
         assert native.query(board=slug)["error"] == "board_required"
     assert native.query(task_id=native.task + " ")["error"] == "task_invalid"
-    assert native.query(database="/foreign.db")["error"] == "invalid_arguments"
+    # Newer stock registries reject extra parameters before calling the plugin.
+    assert native.query(database="/foreign.db")["error"] in {
+        "invalid_arguments",
+        "database: not a parameter of delivery_context. The tool was NOT invoked. "
+        "Valid parameters: board, task_id.",
+    }
+    # Keep the plugin's own strict rejection covered on every supported runtime.
+    from tools.registry import registry
+    handler = registry.get_entry("delivery_context", scope=native.manager.scope_key).handler
+    result = json.loads(handler({"board": native.board, "task_id": native.task, "database": "/foreign.db"}))
+    assert result == {"ok": False, "error": "invalid_arguments"}
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "1")
     assert native.query()["error"] == "worker_identity_incomplete"
 
