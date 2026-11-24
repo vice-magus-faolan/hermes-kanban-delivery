@@ -869,8 +869,9 @@ def test_native_manual_completion_has_incomplete_claim_history(native):
 def service(native):
     """Use the registered plugin's modules, not a second source import."""
     from tools.registry import registry
-    handler = registry.get_entry("delivery_context", scope=native.manager.scope_key).handler
-    return sys.modules[handler.__module__]
+    entry = registry.get_entry("delivery_context", scope=native.manager.scope_key)
+    assert entry is not None
+    return sys.modules[entry.handler.__module__]
 
 
 @pytest.mark.parametrize("segment", [".", ".."])
@@ -930,7 +931,7 @@ def test_policy_byte_boundary(native, size):
 @pytest.mark.parametrize("size", [32768, 32769])
 def test_response_encoded_byte_boundary(native, service, monkeypatch, size):
     # Isolate the final application envelope; do not replace its JSON encoder.
-    queries = service.Queries(type("Config", (), {"get_config": lambda *args: None})())
+    queries = service.Queries(native_context=None)
     response = {"ok": True, "padding": "é\n"}
     overhead = len(json.dumps(response, ensure_ascii=False).encode("utf-8"))
     response["padding"] += "x" * (size - overhead)
@@ -993,13 +994,11 @@ def test_object_json_character_boundary(service, size):
             values.object_json(raw)
 
 
-
 def test_snapshot_query_only(native, service):
     filename = Path(native.conn.execute("PRAGMA database_list").fetchone()[2])
     with service.store.snapshot(filename) as conn:
         # mode=ro already blocks disk writes; observe this independent defense.
         assert conn.execute("PRAGMA query_only").fetchone()[0] == 1
-
 
 
 def test_snapshot_work_budget(native, service):
@@ -1009,7 +1008,6 @@ def test_snapshot_work_budget(native, service):
         with pytest.raises(sqlite3.OperationalError, match="^interrupted$"):
             conn.execute("WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<1000000) "
                          "SELECT sum(x) FROM n").fetchone()
-
 
 
 def test_kanban_home_override_fence(native, monkeypatch, tmp_path):
@@ -1026,7 +1024,6 @@ def test_worker_run_id_format(native, monkeypatch, raw):
     pin(native, monkeypatch, "builder")
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", raw)
     assert native.query() == {"ok": False, "error": "worker_identity_incomplete"}
-
 
 
 def test_worker_stale_existing_run(native, monkeypatch):
@@ -1059,7 +1056,6 @@ def test_lock_ref_components(native, ref):
         "state": "invalid", "diagnostics": ["integration_target_ref_invalid"]}
 
 
-
 def test_effect_prose_is_unknown(native):
     config = git_policy()
     config.update(push="PRIVATE_EFFECT_PROSE_CANARY", deployment="allowed")
@@ -1077,7 +1073,6 @@ def test_policy_version_requires_integer(native, version):
         "state": "invalid", "diagnostics": ["policy_version_invalid"]}
 
 
-
 def test_stale_handoff_after_return(native, service):
     native.claim()
     native.handoff()
@@ -1088,7 +1083,6 @@ def test_stale_handoff_after_return(native, service):
     # directly, since the public phase already withholds a returned artifact.
     with pytest.raises(service.QueryError, match="^handoff_stale$"):
         service.context.handoff_before(runs, events, native.run + 1)
-
 
 
 def test_returned_builder_requires_matching_implementer(native):
@@ -1124,7 +1118,6 @@ def test_cli_error_exit_one(native, operation):
     result = cli("delivery", operation, "--board", "../project", check=False)
     assert result.returncode == 1, result.stdout + result.stderr
     assert json.loads(result.stdout) == {"ok": False, "error": "board_required"}
-
 
 
 def test_bounded_native_history(native):
