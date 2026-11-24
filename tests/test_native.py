@@ -1028,12 +1028,12 @@ def test_worker_run_id_format(native, monkeypatch, raw):
 
 def test_worker_stale_existing_run(native, monkeypatch):
     native.claim()
-    old = native.run
-    native.handoff()
-    native.claim(review=True)
-    pin(native, monkeypatch, "reviewer")
+    pin(native, monkeypatch, "builder")
     assert native.query()["ok"]
-    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(old))
+    # Isolate task/run binding: the genuine run remains otherwise current,
+    # running and owned by this actor, so the actor check cannot mask this guard.
+    native.conn.execute("UPDATE tasks SET current_run_id=NULL WHERE id=?", (native.task,))
+    native.conn.commit()
     assert native.query() == {"ok": False, "error": "worker_run_stale"}
 
 
@@ -1085,7 +1085,8 @@ def test_stale_handoff_after_return(native, service):
         service.context.handoff_before(runs, events, native.run + 1)
 
 
-def test_returned_builder_requires_matching_implementer(native):
+@pytest.mark.parametrize("claimed", [False, True])
+def test_returned_builder_requires_matching_implementer(native, claimed):
     native.claim()
     native.handoff()
     native.claim(review=True)
@@ -1097,10 +1098,11 @@ def test_returned_builder_requires_matching_implementer(native):
     payload["implementer"] = "outsider"
     native.conn.execute("UPDATE task_events SET payload=? WHERE id=?", (json.dumps(payload), row["id"]))
     native.conn.commit()
-    native.claim()
+    if claimed:
+        native.claim()
     view = native.query()["context"]
     assert view["phase"] == "unknown"
-    assert view["diagnostics"] == ["return_provenance_missing"]
+    assert view["diagnostics"] == ["return_provenance_missing" if claimed else "phase_evidence_incomplete"]
 
 
 @pytest.mark.parametrize("approved", [1, "true", False, None])
