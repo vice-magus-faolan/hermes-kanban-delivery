@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Canonical container boundary: run from the plugin Git root.
 set -euo pipefail
-image=${DELIVERY_TEST_IMAGE:-hermes-kanban-delivery:v0.22.5}
+image=${DELIVERY_TEST_IMAGE:-hermes-kanban-delivery:v0.23.3}
 run="kanban-delivery-$(date +%s%N)-$$"
 label="org.hermes-kanban-delivery.run=$run"
 staging=''
@@ -72,6 +72,7 @@ done
 chmod -R a+rX "$staging/source"
 if [[ $# -eq 0 ]]; then set -- bash scripts/verify.sh; fi
 docker run --rm --name "$run" --label "$label" --network none \
+    --env "DELIVERY_EXPECTED_HERMES=${DELIVERY_EXPECTED_HERMES-}" \
     --read-only --user 65532:65532 --cap-drop ALL --security-opt no-new-privileges \
     --cpus 2 --memory 2g --pids-limit 256 \
     --tmpfs /scratch:rw,nosuid,nodev,size=512m,mode=1777 \

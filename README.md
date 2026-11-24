@@ -53,7 +53,8 @@ files or force a journal change to make an observation succeed.
 ## Install and query
 
 This is a native directory plugin with no third-party Python runtime dependencies.
-The supported test targets are stock Hermes v0.22.2 and v0.22.5 on Linux x86-64.
+The supported test targets are stock Hermes v0.22.2, v0.22.5, v0.23.1 and v0.23.3
+on Linux x86-64.
 Other releases and architectures are not verified.
 Verification separates online native dependency/plugin admission during image
 setup from network-denied product queries; it never activates a live profile.
@@ -134,7 +135,7 @@ report lists to 16 identities. Diagnostics are code-authored, never raw exceptio
 
 Stock native `connect` can initialize/migrate, and `kanban_show` includes prose,
 unrelated role history and a capped event tail. `delivery/store.py` is therefore
-a narrow read-only SQLite compatibility adapter for the two tested release
+a narrow read-only SQLite compatibility adapter for the four tested release
 schemas. It uses task-local parameterized SELECTs in one snapshot, `mode=ro` and
 `query_only`, without schema repair or lifecycle SQL writes. Native profile/root
 and dispatcher-ownership helpers retain their existing scope semantics. Schema

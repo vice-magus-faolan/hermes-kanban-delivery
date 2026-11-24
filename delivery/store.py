@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Narrow compatibility reader for stock Hermes 0.22 native storage.
+"""Narrow compatibility reader for stock Hermes 0.22 and 0.23 native storage.
 
 The public connect/show paths initialize stores and render unrelated prose.
 This adapter opens only canonical existing stores, with no schema repair, and
