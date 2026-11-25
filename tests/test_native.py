@@ -865,6 +865,263 @@ def test_native_manual_completion_has_incomplete_claim_history(native):
     assert view["review"]["state"] == "unknown"
 
 
+@pytest.fixture
+def service(native):
+    """Use the registered plugin's modules, not a second source import."""
+    from tools.registry import registry
+    entry = registry.get_entry("delivery_context", scope=native.manager.scope_key)
+    assert entry is not None
+    return sys.modules[entry.handler.__module__]
+
+
+@pytest.mark.parametrize("segment", [".", ".."])
+def test_report_path_segments(native, segment):
+    native.claim()
+    native.handoff({"artifact_kind": "report", "artifacts": [
+        {"path": f"/reports/{segment}/result.json", "sha256": "c" * 64}]})
+    native.claim(review=True)
+    view = native.query()["context"]
+    assert view["artifact"] is None
+    assert view["diagnostics"] == ["report_identity_invalid"]
+
+
+@pytest.mark.parametrize("control", ["\n", "\x00", "\x7f"])
+def test_report_path_control_characters(native, control):
+    native.claim()
+    native.handoff({"artifact_kind": "report", "artifacts": [
+        {"path": f"/reports/result{control}.json", "sha256": "c" * 64}]})
+    native.claim(review=True)
+    view = native.query()["context"]
+    assert view["artifact"] is None
+    assert view["diagnostics"] == ["report_identity_invalid"]
+
+
+@pytest.mark.parametrize("count", [16, 17])
+def test_report_count_boundary(native, count):
+    reports = [{"path": f"/reports/{i}.json", "sha256": "c" * 64} for i in range(count)]
+    native.claim()
+    native.handoff({"artifact_kind": "report", "artifacts": reports})
+    native.claim(review=True)
+    view = native.query()["context"]
+    if count == 16:
+        assert view["artifact"] == {"kind": "report", "artifacts": reports}
+        assert view["diagnostics"] == []
+    else:
+        assert view["artifact"] is None
+        assert view["diagnostics"] == ["report_identity_invalid"]
+
+
+@pytest.mark.parametrize("size", [1048576, 1048577])
+def test_policy_byte_boundary(native, size):
+    # Valid JSON padding, including a multibyte character: cap counts file bytes.
+    # Put padding inside an ignored top-level field.
+    policy = json.loads(native.policy.read_text())
+    policy["padding"] = "é"
+    raw = json.dumps(policy, ensure_ascii=False).encode()
+    raw += b" " * (size - len(raw))
+    assert len(raw) == size
+    native.policy.write_bytes(raw)
+    result = native.query("delivery_policy_check")["policy"]
+    if size == 1048576:
+        assert result["state"] == "valid"
+    else:
+        assert result == {"state": "invalid", "diagnostics": ["policy_size_limit"]}
+
+
+@pytest.mark.parametrize("size", [32768, 32769])
+def test_response_encoded_byte_boundary(native, service, monkeypatch, size):
+    # Isolate the final application envelope; do not replace its JSON encoder.
+    queries = service.Queries(native_context=None)
+    response = {"ok": True, "padding": "é\n"}
+    overhead = len(json.dumps(response, ensure_ascii=False).encode("utf-8"))
+    response["padding"] += "x" * (size - overhead)
+    assert len(json.dumps(response, ensure_ascii=False).encode("utf-8")) == size
+    monkeypatch.setattr(queries, "_query", lambda *args: response)
+    result = queries.query("delivery_context", {})
+    assert result == (response if size == 32768 else {"ok": False, "error": "response_limit"})
+
+
+@pytest.mark.parametrize("count", [512, 513])
+def test_event_count_boundary(native, service, count):
+    native.claim()
+    # Clone native-produced events to isolate the event cap from the 128-run cap.
+    row = dict(native.conn.execute("SELECT * FROM task_events WHERE task_id=? AND kind='claimed'",
+                                   (native.task,)).fetchone())
+    row.pop("id")
+    columns = ",".join(row)
+    placeholders = ",".join("?" for _ in row)
+    current = native.conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind='claimed'",
+                                  (native.task,)).fetchone()[0]
+    native.conn.executemany(f"INSERT INTO task_events ({columns}) VALUES ({placeholders})",
+                           [tuple(row.values())] * (count - current))
+    native.conn.commit()
+    if count == 512:
+        runs, events = service.store.history(native.conn, native.task)
+        assert len(runs) == 1 and len(events) == 512
+    else:
+        with pytest.raises(service.QueryError, match="^history_limit$"):
+            service.store.history(native.conn, native.task)
+
+
+@pytest.mark.parametrize("field", ["metadata", "payload"])
+@pytest.mark.parametrize("size", [65536, 65537])
+def test_native_field_character_boundary(native, service, field, size):
+    native.claim()
+    # SQLite length(TEXT) and object_json count characters, not UTF-8 bytes.
+    raw = json.dumps({"padding": "é"}, ensure_ascii=False)
+    raw = raw[:-1] + " " * (size - len(raw)) + "}"
+    assert len(raw) == size and len(raw.encode()) > size
+    table = "task_runs" if field == "metadata" else "task_events"
+    native.conn.execute(f"UPDATE {table} SET {field}=? WHERE task_id=?", (raw, native.task))
+    native.conn.commit()
+    if size == 65536:
+        runs, events = service.store.history(native.conn, native.task)
+        rows = runs if field == "metadata" else events
+        assert rows and all(row[field] == {"padding": "é"} for row in rows)
+    else:
+        with pytest.raises(service.QueryError, match="^native_metadata_unavailable$"):
+            service.store.history(native.conn, native.task)
+
+
+@pytest.mark.parametrize("size", [65536, 65537])
+def test_object_json_character_boundary(service, size):
+    raw = '{"padding":"é"}' + " " * (size - len('{"padding":"é"}'))
+    values = sys.modules[service.store.object_json.__module__]
+    if size == 65536:
+        assert values.object_json(raw) == {"padding": "é"}
+    else:
+        with pytest.raises(service.QueryError, match="^native_metadata_unavailable$"):
+            values.object_json(raw)
+
+
+def test_snapshot_query_only(native, service):
+    filename = Path(native.conn.execute("PRAGMA database_list").fetchone()[2])
+    with service.store.snapshot(filename) as conn:
+        # mode=ro already blocks disk writes; observe this independent defense.
+        assert conn.execute("PRAGMA query_only").fetchone()[0] == 1
+
+
+def test_snapshot_work_budget(native, service):
+    filename = Path(native.conn.execute("PRAGMA database_list").fetchone()[2])
+    with service.store.snapshot(filename) as conn:
+        assert conn.execute("SELECT 1").fetchone()[0] == 1
+        with pytest.raises(sqlite3.OperationalError, match="^interrupted$"):
+            conn.execute("WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<1000000) "
+                         "SELECT sum(x) FROM n").fetchone()
+
+
+def test_kanban_home_override_fence(native, monkeypatch, tmp_path):
+    assert native.query("delivery_policy_check")["policy"]["state"] == "valid"
+    foreign = tmp_path / "foreign-home"
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(foreign))
+    assert native.query("delivery_policy_check") == {"ok": False, "error": "store_fence"}
+    assert not foreign.exists()
+
+
+@pytest.mark.parametrize("raw", ["01", "+1", "1 ", "١", "0", "1234567890123456789"])
+def test_worker_run_id_format(native, monkeypatch, raw):
+    native.claim()
+    pin(native, monkeypatch, "builder")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", raw)
+    assert native.query() == {"ok": False, "error": "worker_identity_incomplete"}
+
+
+def test_worker_stale_existing_run(native, monkeypatch):
+    native.claim()
+    pin(native, monkeypatch, "builder")
+    assert native.query()["ok"]
+    # Isolate task/run binding: the genuine run remains otherwise current,
+    # running and owned by this actor, so the actor check cannot mask this guard.
+    native.conn.execute("UPDATE tasks SET current_run_id=NULL WHERE id=?", (native.task,))
+    native.conn.commit()
+    assert native.query() == {"ok": False, "error": "worker_run_stale"}
+
+
+@pytest.mark.parametrize("field", ["host", "user"])
+@pytest.mark.parametrize("whitespace", [" ", "\u00a0"])
+def test_ssh_whitespace(native, field, whitespace):
+    config = git_policy("ssh")
+    config["ssh"][field] += whitespace + "suffix"
+    native.write_policy(config)
+    assert native.query("delivery_policy_check")["policy"] == {
+        "state": "invalid", "diagnostics": ["ssh_invalid"]}
+
+
+@pytest.mark.parametrize("ref", ["refs/heads/main.lock", "refs/heads/topic.lock/main"])
+def test_lock_ref_components(native, ref):
+    config = git_policy()
+    config["integration_target_ref"] = ref
+    native.write_policy(config)
+    assert native.query("delivery_policy_check")["policy"] == {
+        "state": "invalid", "diagnostics": ["integration_target_ref_invalid"]}
+
+
+def test_effect_prose_is_unknown(native):
+    config = git_policy()
+    config.update(push="PRIVATE_EFFECT_PROSE_CANARY", deployment="allowed")
+    native.write_policy(config)
+    effects = native.query("delivery_policy_check")["policy"]["config"]["effects"]
+    assert effects == {"push": "unknown", "deployment": "allowed", "restart": "unknown", "live_evaluation": "unknown"}
+
+
+@pytest.mark.parametrize("version", [True, False, 2.0, "2", None])
+def test_policy_version_requires_integer(native, version):
+    policy = json.loads(native.policy.read_text())
+    policy["policy_version"] = version
+    native.policy.write_text(json.dumps(policy))
+    assert native.query("delivery_policy_check")["policy"] == {
+        "state": "invalid", "diagnostics": ["policy_version_invalid"]}
+
+
+def test_stale_handoff_after_return(native, service):
+    native.claim()
+    native.handoff()
+    native.claim(review=True)
+    assert native.kb.request_changes(native.conn, native.task, reason="Synthetic rework", expected_run_id=native.run)[0]
+    runs, events = service.store.history(native.conn, native.task)
+    # No new handoff exists after this real native return. Test the selector
+    # directly, since the public phase already withholds a returned artifact.
+    with pytest.raises(service.QueryError, match="^handoff_stale$"):
+        service.context.handoff_before(runs, events, native.run + 1)
+
+
+@pytest.mark.parametrize("claimed", [False, True])
+def test_returned_builder_requires_matching_implementer(native, claimed):
+    native.claim()
+    native.handoff()
+    native.claim(review=True)
+    assert native.kb.request_changes(native.conn, native.task, reason="Synthetic rework", expected_run_id=native.run)[0]
+    # Corrupt only attribution in otherwise genuine return evidence.
+    row = native.conn.execute("SELECT id,payload FROM task_events WHERE task_id=? AND kind='changes_requested'",
+                              (native.task,)).fetchone()
+    payload = json.loads(row["payload"])
+    payload["implementer"] = "outsider"
+    native.conn.execute("UPDATE task_events SET payload=? WHERE id=?", (json.dumps(payload), row["id"]))
+    native.conn.commit()
+    if claimed:
+        native.claim()
+    view = native.query()["context"]
+    assert view["phase"] == "unknown"
+    assert view["diagnostics"] == ["return_provenance_missing" if claimed else "phase_evidence_incomplete"]
+
+
+@pytest.mark.parametrize("approved", [1, "true", False, None])
+def test_review_approved_is_literal_true(native, approved):
+    native.claim()
+    native.handoff()
+    native.claim(review=True)
+    native.complete({"approved": approved, "review_outcome": "approved", "reviewed_commit": SHA})
+    review = native.query()["context"]["review"]
+    assert review == {"state": "unknown", "diagnostics": ["explicit_review_missing"]}
+
+
+@pytest.mark.parametrize("operation", ["context", "policy-check"])
+def test_cli_error_exit_one(native, operation):
+    result = cli("delivery", operation, "--board", "../project", check=False)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert json.loads(result.stdout) == {"ok": False, "error": "board_required"}
+
+
 def test_bounded_native_history(native):
     native.claim()
     for index in range(64):

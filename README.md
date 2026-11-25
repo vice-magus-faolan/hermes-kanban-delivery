@@ -125,8 +125,8 @@ changes configuration/current board or installs enforcement hooks.
 
 Policy input must be a regular file and is capped at 1 MiB; FIFOs and other
 nonregular inputs are refused without waiting for a writer. Each task query reads
-at most 128 runs and 512 relevant lifecycle events, with 64 KiB per
-metadata/payload field and a bounded
+at most 128 runs and 512 relevant lifecycle events, with 65,536 characters per
+metadata/payload TEXT field (SQLite `length`, not UTF-8 bytes) and a bounded
 SQLite work budget. Larger/incomplete history is explicitly unknown, never a
 truncated history presented as complete. Encoded replies are capped at 32 KiB;
 `response_limit` refuses an oversized result instead of silently truncating an
